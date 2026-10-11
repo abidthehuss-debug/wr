@@ -1,0 +1,532 @@
+#!/usr/bin/env bash
+# lavish-review — the canonical workshop interface to Lavish visual review.
+#
+# This is the ONLY supported way for workshop agents to run Lavish. It owns:
+# the pinned workshop-local runtime (workshop/vendor/lavish), Codespaces host
+# configuration, the single stale-server policy, artifact preparation, session
+# recording, bounded polling, refresh-on-reply, ending, and preflight checks.
+#
+# Subcommands:
+#   install                       install/repair the pinned runtime + patch
+#   open <project-dir|file.html> [--reopen] [--fresh] [--no-gate]
+#                                 build/validate the artifact, open the review,
+#                                 print the attendee URL
+#   poll [--timeout-ms N]         wait (bounded) for attendee feedback
+#   reply "<message>"             rebuild a Vite artifact if needed, show the
+#                                 agent's reply in the review, and poll again
+#   end                           end the review session (agent side)
+#   status                        read-only preflight diagnostics
+#   stop                          stop the Lavish server on this port
+#   playbook [id] | design        upstream artifact-authoring guidance
+#   export <file.html> [...]      write a portable single-file copy
+#   share <file.html> [...]       publish to ht-ml.app (explicit user request
+#                                 only; public by default)
+#
+# Server lifecycle policy (the one policy): the server starts on demand from
+# `open`, is replaced only when a health probe proves it is a stale Lavish
+# (wrong version or missing workshop patch), and otherwise shuts itself down
+# when idle. Port 4387 stays bound to 127.0.0.1 behind the private Codespaces
+# forwarding boundary; the allowlist is always the single exact forwarded host.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "$script_dir/../.." && pwd)"
+vendor_dir="$repo_root/workshop/vendor/lavish"
+lavish_cli="$vendor_dir/node_modules/lavish-axi/dist/cli.mjs"
+patch_script="$script_dir/patch-lavish-feedback.mjs"
+state_dir="$repo_root/.lavish"
+active_record="$state_dir/active-review.json"
+last_poll_file="$state_dir/last-poll.txt"
+pending_feedback_file="$state_dir/pending-feedback.txt"
+pending_feedback_artifact_file="$state_dir/pending-feedback.artifact"
+poll_lock_file="$state_dir/poll.lock"
+default_poll_timeout_ms=90000
+
+usage() {
+  sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  exit 2
+}
+
+fail() {
+  echo "lavish-review: $*" >&2
+  echo "If this blocks a required visual review, run Claude /troubleshoot or Codex \$troubleshoot with the message above." >&2
+  exit 1
+}
+
+need_node() {
+  command -v node >/dev/null 2>&1 || fail "Node.js was not found on PATH."
+}
+
+run_lavish() {
+  node "$lavish_cli" "$@"
+}
+
+pinned_version() {
+  node -p "require('$vendor_dir/package.json').dependencies['lavish-axi']"
+}
+
+installed_version() {
+  node -p "require('$vendor_dir/node_modules/lavish-axi/package.json').version" 2>/dev/null || true
+}
+
+patch_marker() {
+  node --input-type=module -e "const m = await import('file://$patch_script'); console.log(m.patchMarker)"
+}
+
+read_record() {
+  node -p "const r=require('$active_record'); r['$1'] ?? ''" 2>/dev/null || true
+}
+
+# --- environment -------------------------------------------------------------
+
+lavish_port="${LAVISH_AXI_PORT:-4387}"
+case "$lavish_port" in
+  '' | *[!0-9]*) fail "Invalid LAVISH_AXI_PORT '${lavish_port}'. It must be a number between 1 and 65535." ;;
+esac
+if [ "$lavish_port" -lt 1 ] || [ "$lavish_port" -gt 65535 ]; then
+  fail "Invalid LAVISH_AXI_PORT '${lavish_port}'. It must be a number between 1 and 65535."
+fi
+
+codespaces_host=""
+configure_environment() {
+  # Lavish stays bound to loopback; Codespaces provides the authenticated
+  # HTTPS forwarding boundary. Never bind wider and never widen the allowlist.
+  export LAVISH_AXI_PORT="$lavish_port"
+  export LAVISH_AXI_HOST="127.0.0.1"
+  export LAVISH_AXI_LINK_HOST="127.0.0.1"
+  # Server state lives inside the repository (gitignored) so every provider
+  # sandbox — including Codex's workspace-write, which cannot write $HOME —
+  # can run the detached server, and state survives container rebuilds.
+  export LAVISH_AXI_STATE_DIR="${LAVISH_AXI_STATE_DIR:-$repo_root/.workshop-local/lavish-state}"
+  mkdir -p "$LAVISH_AXI_STATE_DIR"
+  # Container-local browser opening is unreliable; the URL is printed instead.
+  export LAVISH_AXI_NO_OPEN=1
+  if [ "${CODESPACES:-}" = "true" ]; then
+    if [ -z "${CODESPACE_NAME:-}" ] || [ -z "${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN:-}" ]; then
+      fail "Codespaces is active but CODESPACE_NAME or GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN is missing."
+    fi
+    codespaces_host="${CODESPACE_NAME}-${lavish_port}.${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN}"
+    # Exactly one host. A wildcard would disable Lavish's DNS-rebinding guard.
+    export LAVISH_AXI_ALLOWED_HOSTS="$codespaces_host"
+  fi
+}
+
+ensure_runtime() {
+  need_node
+  [ -f "$lavish_cli" ] || fail "The pinned Lavish runtime is not installed. Run: workshop/scripts/lavish-review install"
+  local pinned installed
+  pinned="$(pinned_version)"
+  installed="$(installed_version)"
+  if [ "$installed" != "$pinned" ]; then
+    fail "Installed Lavish '${installed:-none}' does not match the pinned ${pinned}. Run: workshop/scripts/lavish-review install"
+  fi
+  if ! node "$patch_script" --check --quiet "$lavish_cli" >/dev/null 2>&1; then
+    fail "The Lavish workshop compatibility patch is missing. Run: workshop/scripts/lavish-review install"
+  fi
+}
+
+probe_health() {
+  curl -sS -m 3 "http://127.0.0.1:${lavish_port}/health" 2>/dev/null || true
+}
+
+# The single stale-server policy: replace a server only when the probe proves
+# it is a Lavish of the wrong version or without the workshop patch. Never
+# touch a non-Lavish listener.
+ensure_healthy_server() {
+  local health marker pinned
+  health="$(probe_health)"
+  [ -n "$health" ] || return 0
+  if ! grep -q '"app":"lavish-axi"' <<<"$health"; then
+    fail "Port ${lavish_port} is in use by another program (not Lavish). Stop that program or set LAVISH_AXI_PORT to a free port."
+  fi
+  pinned="$(pinned_version)"
+  marker="$(patch_marker)"
+  if grep -q "\"version\":\"${pinned}\"" <<<"$health" && grep -q "\"workshop_feedback_patch\":${marker}" <<<"$health"; then
+    return 0
+  fi
+  echo "Replacing a stale Lavish server on port ${lavish_port}..." >&2
+  run_lavish stop --port "$lavish_port" >/dev/null 2>&1 || true
+  sleep 1
+  health="$(probe_health)"
+  [ -z "$health" ] || fail "A stale Lavish server on port ${lavish_port} could not be stopped."
+}
+
+record_active_review() {
+  mkdir -p "$state_dir"
+  node -e '
+    const fs = require("fs");
+    const [file, artifact, url, kind, projectRoot, port] = process.argv.slice(1);
+    fs.writeFileSync(file, JSON.stringify({
+      artifact, url, kind,
+      project_root: projectRoot || null,
+      port: Number(port),
+      opened_at: new Date().toISOString(),
+    }, null, 2) + "\n");
+  ' "$active_record" "$1" "$2" "$3" "${4:-}" "$lavish_port"
+}
+
+resolve_artifact() {
+  local artifact="${1:-}"
+  if [ -z "$artifact" ]; then
+    artifact="$(read_record artifact)"
+  fi
+  if [ -z "$artifact" ] || [ ! -f "$artifact" ]; then
+    echo "lavish-review: no active review. Run: workshop/scripts/lavish-review open <project-dir|file.html>" >&2
+    exit 2
+  fi
+  printf '%s\n' "$artifact"
+}
+
+rebuild_vite_artifact() {
+  local project_root="$1" output_directory="${2:-$1/.lavish/app-review}"
+  echo "Building the application review artifact..." >&2
+  (cd "$project_root" && npm run build -- --base ./ 1>&2) \
+    || fail "The application build failed. Fix the build errors above, then retry."
+  node "$script_dir/prepare-lavish-vite.mjs" "$project_root/dist" "$output_directory" 1>&2
+}
+
+print_poll_result() {
+  # Show the payload minus upstream's next_step (which names the bare binary)
+  # and the potentially huge dom_snapshot line; both stay in last-poll.txt.
+  grep -vE '^(next_step:|dom_snapshot:)' <<<"$1" || true
+}
+
+store_pending_feedback() {
+  local output="$1" artifact="$2" temporary artifact_temporary
+  temporary="$(mktemp "$state_dir/.pending-feedback.XXXXXX")"
+  artifact_temporary="$(mktemp "$state_dir/.pending-feedback-artifact.XXXXXX")"
+  printf '%s\n' "$output" >"$temporary"
+  printf '%s\n' "$artifact" >"$artifact_temporary"
+  mv "$artifact_temporary" "$pending_feedback_artifact_file"
+  mv "$temporary" "$pending_feedback_file"
+}
+
+print_poll_outcome() {
+  local output="$1"
+  print_poll_result "$output"
+  if grep -qE '^[[:space:]]*(session_ended: true|status: ended)' <<<"$output"; then
+    rm -f "$active_record"
+    echo "Status: ended"
+    echo "The attendee ended the review. Continue the build step; do not reopen the review uninvited."
+  elif grep -qE '^[[:space:]]*status: feedback' <<<"$output"; then
+    echo "Status: feedback"
+    echo "The full payload (including the DOM snapshot) is saved in .lavish/last-poll.txt."
+    echo "Next: apply the feedback to the real project source, then run: workshop/scripts/lavish-review reply \"<what you changed>\""
+  else
+    echo "Status: waiting"
+    echo "No feedback yet. Next: run workshop/scripts/lavish-review poll again and keep waiting."
+  fi
+}
+
+# --- subcommands -------------------------------------------------------------
+
+cmd_install() {
+  need_node
+  command -v npm >/dev/null 2>&1 || fail "npm was not found on PATH."
+  local pinned
+  pinned="$(pinned_version)"
+  if [ -f "$lavish_cli" ] && [ "$(installed_version)" = "$pinned" ] \
+    && node "$patch_script" --check --quiet "$lavish_cli" >/dev/null 2>&1; then
+    echo "Lavish ${pinned} is already installed and patched."
+    return 0
+  fi
+  echo "Installing the pinned Lavish runtime (${pinned})..."
+  (cd "$vendor_dir" && npm ci --ignore-scripts --no-audit --no-fund) \
+    || fail "npm ci failed for the pinned Lavish runtime. Check network access and retry: workshop/scripts/lavish-review install"
+  node "$patch_script" --quiet "$lavish_cli" \
+    || fail "The workshop compatibility patch could not be applied to Lavish ${pinned}."
+  node "$patch_script" --check --quiet "$lavish_cli" \
+    || fail "The Lavish patch did not verify after installation."
+  echo "Lavish $(installed_version) installed and patched."
+}
+
+cmd_open() {
+  local target="" reopen_flag="" fresh_flag="" gate_flag=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --reopen) reopen_flag="--reopen" ;;
+      --fresh) fresh_flag="--fresh" ;;
+      --no-gate) gate_flag="--no-gate" ;;
+      --*) fail "Unknown open flag '$1'. Supported: --reopen, --fresh, --no-gate." ;;
+      *)
+        [ -z "$target" ] || usage
+        target="$1"
+        ;;
+    esac
+    shift
+  done
+  [ -n "$target" ] || usage
+  ensure_runtime
+  configure_environment
+  ensure_healthy_server
+
+  local kind artifact project_root="" artifact_directory=""
+  if [ -d "$target" ] && [ -f "$target/package.json" ]; then
+    kind="vite"
+    project_root="$(cd "$target" && pwd)"
+    artifact_directory="$project_root/.lavish/app-review"
+    if [ -n "$fresh_flag" ]; then
+      mkdir -p "$project_root/.lavish"
+      artifact_directory="$project_root/.lavish/app-review-fresh-${BASHPID}-${RANDOM}"
+      [ ! -e "$artifact_directory" ] || fail "Could not allocate a fresh review artifact path; retry the open command."
+    fi
+    rebuild_vite_artifact "$project_root" "$artifact_directory"
+    artifact="$artifact_directory/index.html"
+  elif [ -f "$target" ] && [[ "$target" == *.html ]]; then
+    kind="static"
+    artifact="$(cd "$(dirname "$target")" && pwd)/$(basename "$target")"
+    node "$script_dir/prepare-lavish-static.mjs" "$artifact" 1>&2
+  else
+    fail "'$target' is neither a project directory with package.json nor an .html file."
+  fi
+
+  # Capture, then print. Never stream the open output through a pipe: block
+  # buffering on a non-TTY stdout can withhold the session URL indefinitely.
+  local output url
+  if ! output="$(run_lavish "$artifact" --no-open ${reopen_flag:+"$reopen_flag"} ${gate_flag:+"$gate_flag"} 2>&1)"; then
+    printf '%s\n' "$output" >&2
+    if grep -qi 'reopen' <<<"$output"; then
+      fail "The attendee ended this review. Reopen only if they ask: workshop/scripts/lavish-review open $target --reopen"
+    fi
+    fail "Lavish could not open the review session."
+  fi
+  # Upstream refuses a user-ended session with exit 0 and a status line.
+  if grep -qE '^[[:space:]]*status: user-ended' <<<"$output"; then
+    echo "The attendee ended this review from the browser; it was NOT reopened." >&2
+    echo "Do not reopen it uninvited. If the attendee asked for another look, run:" >&2
+    echo "  workshop/scripts/lavish-review open $target --reopen" >&2
+    exit 1
+  fi
+  url="$(grep -oE 'http://[^" ]+/session/[a-z0-9]+' <<<"$output" | head -1)"
+  if [ -z "$url" ]; then
+    printf '%s\n' "$output" >&2
+    fail "Lavish did not print a session URL."
+  fi
+  if [ -n "$codespaces_host" ]; then
+    url="${url//http:\/\/127.0.0.1:${lavish_port}/https://${codespaces_host}}"
+    url="${url//http:\/\/localhost:${lavish_port}/https://${codespaces_host}}"
+  fi
+  record_active_review "$artifact" "$url" "$kind" "$project_root"
+  # An explicit reopen starts a new attendee review pass. Any prior final
+  # feedback has already been handed to the agent and must not be replayed.
+  if [ -n "$reopen_flag" ] || [ -n "$fresh_flag" ]; then
+    rm -f "$pending_feedback_file" "$pending_feedback_artifact_file"
+  fi
+  grep '^self_paint_warning:' <<<"$output" || true
+  echo "Review URL: $url"
+  echo "Give the attendee exactly this URL and ask them to open it in a browser tab."
+  echo "Next: workshop/scripts/lavish-review poll"
+}
+
+cmd_poll() {
+  local timeout_ms="$default_poll_timeout_ms" agent_reply="" artifact_arg=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --timeout-ms)
+        shift
+        timeout_ms="${1:-}"
+        ;;
+      --agent-reply)
+        shift
+        agent_reply="${1:-}"
+        ;;
+      --*) fail "Unknown poll flag '$1'." ;;
+      *) artifact_arg="$1" ;;
+    esac
+    shift || true
+  done
+  case "$timeout_ms" in '' | *[!0-9]*) fail "Invalid --timeout-ms '${timeout_ms}'." ;; esac
+  ensure_runtime
+  configure_environment
+  mkdir -p "$state_dir"
+
+  # Poll delivery is destructive upstream. Agent harnesses can interrupt a
+  # tool call without immediately stopping its child process, so two polls may
+  # briefly overlap. Serialize them and replay delivered feedback until the
+  # agent explicitly replies; otherwise a hidden poll can consume a comment
+  # while the visible poll reports only "ended".
+  local poll_fd
+  exec {poll_fd}>"$poll_lock_file"
+  if ! flock -n "$poll_fd"; then
+    echo "Another Lavish poll is finishing; waiting to recover any feedback it received..." >&2
+    flock "$poll_fd"
+  fi
+
+  if [ -z "$agent_reply" ] && [ -s "$pending_feedback_file" ] && [ -s "$pending_feedback_artifact_file" ]; then
+    local pending_output pending_artifact current_artifact=""
+    pending_artifact="$(<"$pending_feedback_artifact_file")"
+    if [ -n "$artifact_arg" ]; then
+      [ ! -f "$artifact_arg" ] || current_artifact="$(cd "$(dirname "$artifact_arg")" && pwd)/$(basename "$artifact_arg")"
+    else
+      current_artifact="$(read_record artifact)"
+    fi
+    if [ -z "$current_artifact" ] || [ "$current_artifact" = "$pending_artifact" ]; then
+      pending_output="$(<"$pending_feedback_file")"
+      printf '%s\n' "$pending_output" >"$last_poll_file"
+      print_poll_outcome "$pending_output"
+      return 0
+    fi
+  fi
+
+  local artifact
+  artifact="$(resolve_artifact "$artifact_arg")"
+
+  local args=(poll "$artifact" --timeout-ms "$timeout_ms")
+  [ -n "$agent_reply" ] && args=(poll "$artifact" --agent-reply "$agent_reply" --timeout-ms "$timeout_ms")
+  local output rc=0
+  output="$(run_lavish "${args[@]}" 2>&1)" || rc=$?
+  # Poll delivery is destructive upstream; keep the raw payload recoverable.
+  printf '%s\n' "$output" >"$last_poll_file"
+  if [ "$rc" -ne 0 ]; then
+    printf '%s\n' "$output" >&2
+    fail "Polling the review failed (see the message above)."
+  fi
+
+  if grep -qE '^[[:space:]]*status: feedback' <<<"$output"; then
+    store_pending_feedback "$output" "$artifact"
+  elif [ -n "$agent_reply" ]; then
+    rm -f "$pending_feedback_file" "$pending_feedback_artifact_file"
+  fi
+
+  print_poll_outcome "$output"
+}
+
+cmd_reply() {
+  local message="${1:-}"
+  [ -n "$message" ] || fail "Usage: workshop/scripts/lavish-review reply \"<what you changed>\""
+  shift
+  ensure_runtime
+  configure_environment
+  # Refresh a Vite artifact first so the attendee sees the applied change
+  # (Lavish live-reloads the artifact file); static artifacts are edited in
+  # place and reload on their own.
+  local kind project_root artifact artifact_directory
+  kind="$(read_record kind)"
+  project_root="$(read_record project_root)"
+  artifact="$(read_record artifact)"
+  if [ "$kind" = "vite" ] && [ -n "$project_root" ] && [ -d "$project_root" ]; then
+    artifact_directory="$(dirname "$artifact")"
+    rebuild_vite_artifact "$project_root" "$artifact_directory"
+  fi
+  cmd_poll --agent-reply "$message" "$@"
+}
+
+cmd_end() {
+  ensure_runtime
+  configure_environment
+  local artifact
+  artifact="$(resolve_artifact "${1:-}")"
+  run_lavish end "$artifact" >/dev/null 2>&1 || true
+  rm -f "$active_record"
+  echo "Review ended."
+}
+
+cmd_stop() {
+  ensure_runtime
+  configure_environment
+  run_lavish stop --port "$lavish_port" 2>&1 | sed -n '1,4p' || true
+  rm -f "$active_record"
+  echo "Lavish server stopped."
+}
+
+cmd_status() {
+  need_node
+  local failures=0
+  check() { # check <ok|fail> <message>
+    if [ "$1" = ok ]; then
+      echo "OK:   $2"
+    else
+      echo "FAIL: $2"
+      failures=$((failures + 1))
+    fi
+  }
+
+  if [ -f "$lavish_cli" ]; then
+    local pinned installed
+    pinned="$(pinned_version)"
+    installed="$(installed_version)"
+    if [ "$installed" = "$pinned" ]; then
+      check ok "Pinned Lavish runtime ${pinned} is installed (workshop/vendor/lavish)."
+    else
+      check fail "Installed Lavish '${installed:-none}' differs from pinned ${pinned}. Run: workshop/scripts/lavish-review install"
+    fi
+    if node "$patch_script" --check --quiet "$lavish_cli" >/dev/null 2>&1; then
+      check ok "Workshop compatibility patch is applied."
+    else
+      check fail "Workshop compatibility patch is missing. Run: workshop/scripts/lavish-review install"
+    fi
+  else
+    check fail "Pinned Lavish runtime is not installed. Run: workshop/scripts/lavish-review install"
+  fi
+
+  if [ "${CODESPACES:-}" = "true" ]; then
+    if [ -n "${CODESPACE_NAME:-}" ] && [ -n "${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN:-}" ]; then
+      check ok "Codespaces forwarded host: https://${CODESPACE_NAME}-${lavish_port}.${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN}"
+    else
+      check fail "Codespaces is active but its forwarding environment variables are missing."
+    fi
+  else
+    check ok "Not running in Codespaces; the review URL stays on 127.0.0.1."
+  fi
+
+  local health
+  health="$(probe_health)"
+  if [ -z "$health" ]; then
+    check ok "No Lavish server on port ${lavish_port} (one starts automatically on open)."
+  elif ! grep -q '"app":"lavish-axi"' <<<"$health"; then
+    check fail "Port ${lavish_port} is occupied by another program."
+  elif [ -f "$lavish_cli" ] && grep -q "\"version\":\"$(pinned_version)\"" <<<"$health" \
+    && grep -q "\"workshop_feedback_patch\":$(patch_marker)" <<<"$health"; then
+    check ok "A healthy patched Lavish server is running on port ${lavish_port}."
+    if [ "${CODESPACES:-}" = "true" ] && [ -n "${GITHUB_TOKEN:-}" ]; then
+      local fwd_health
+      fwd_health="$(curl -sS -m 8 -H "X-Github-Token: ${GITHUB_TOKEN}" \
+        "https://${CODESPACE_NAME}-${lavish_port}.${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN}/health" 2>/dev/null || true)"
+      if grep -q '"app":"lavish-axi"' <<<"$fwd_health"; then
+        check ok "The forwarded HTTPS URL reaches the server through the Codespaces proxy."
+      else
+        check fail "The forwarded HTTPS URL did not reach the server (proxy or allowlist problem)."
+      fi
+    fi
+  else
+    check fail "A stale Lavish server (wrong version or missing patch) is on port ${lavish_port}; the next open replaces it."
+  fi
+
+  if [ -f "$active_record" ]; then
+    local artifact
+    artifact="$(read_record artifact)"
+    if [ -n "$artifact" ] && [ -f "$artifact" ]; then
+      check ok "Active review: $(read_record url)"
+    else
+      check fail "The recorded active review artifact is missing; run open again."
+    fi
+  else
+    check ok "No active review session recorded."
+  fi
+
+  [ "$failures" -eq 0 ] || exit 1
+}
+
+command="${1:-}"
+[ $# -gt 0 ] && shift
+case "$command" in
+  install) cmd_install "$@" ;;
+  open) cmd_open "$@" ;;
+  poll) cmd_poll "$@" ;;
+  reply) cmd_reply "$@" ;;
+  end) cmd_end "$@" ;;
+  status) cmd_status "$@" ;;
+  stop) cmd_stop "$@" ;;
+  playbook | design | export | share)
+    # Read-only upstream helpers (and explicit-request publishing), exposed so
+    # nothing ever needs a bare lavish-axi binary on PATH.
+    ensure_runtime
+    configure_environment
+    run_lavish "$command" "$@"
+    ;;
+  '' | help | --help | -h) usage ;;
+  *)
+    echo "lavish-review: unknown subcommand '$command'." >&2
+    usage
+    ;;
+esac

@@ -1,0 +1,15 @@
+{
+  "name": "workshop-lavish-vite-fixture",
+  "private": true,
+  "description": "Deterministic Vite+React fixture exercising the workshop Lavish artifact pipeline: plain localStorage use, an imported asset, a data-URI asset, and String.replace token strings.",
+  "scripts": {
+    "build": "vite build"
+  },
+  "dependencies": {
+    "react": "19.2.4",
+    "react-dom": "19.2.4"
+  },
+  "devDependencies": {
+    "vite": "7.3.2"
+  }
+}

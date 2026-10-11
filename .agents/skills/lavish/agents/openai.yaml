@@ -1,0 +1,4 @@
+interface:
+  display_name: "Lavish Visual Review"
+  short_description: "Open an annotatable visual review page"
+  default_prompt: "Use $lavish to show this visually so I can review and annotate it."

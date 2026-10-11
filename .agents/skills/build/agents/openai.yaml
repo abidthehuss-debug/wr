@@ -1,0 +1,7 @@
+interface:
+  display_name: "Workshop Builder"
+  short_description: "Build exactly one approved plan step"
+  default_prompt: "Use $build to complete exactly one workshop plan step."
+
+policy:
+  allow_implicit_invocation: false

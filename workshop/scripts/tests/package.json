@@ -1,0 +1,9 @@
+{
+  "name": "workshop-lavish-verification",
+  "private": true,
+  "description": "Dev-only browser-test tooling for lavish-verify browser/e2e layers. Installed on demand by maintainers and CI; never part of attendee post-create.",
+  "devDependencies": {
+    "@puppeteer/browsers": "3.2.0",
+    "puppeteer-core": "25.6.0"
+  }
+}

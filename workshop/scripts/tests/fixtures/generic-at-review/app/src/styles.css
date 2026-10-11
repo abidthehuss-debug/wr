@@ -1,0 +1,27 @@
+body {
+  margin: 0;
+  background: #f4f1ea;
+  color: #22303c;
+  font-family: system-ui, sans-serif;
+}
+.app {
+  max-width: 40rem;
+  margin: 0 auto;
+  padding: 2rem 1rem;
+}
+.card {
+  background: #ffffff url(./pattern.svg) repeat;
+  border: 1px solid #d8d2c4;
+  border-radius: 0.5rem;
+  padding: 1rem;
+  margin-top: 1rem;
+}
+.add-note {
+  background: #22303c;
+  color: #f4f1ea;
+  border: 0;
+  border-radius: 0.375rem;
+  padding: 0.5rem 1rem;
+  font-size: 1rem;
+  cursor: pointer;
+}

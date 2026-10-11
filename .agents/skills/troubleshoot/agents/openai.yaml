@@ -1,0 +1,4 @@
+interface:
+  display_name: "Workshop Troubleshooter"
+  short_description: "Diagnose and safely fix workshop problems"
+  default_prompt: "Use $troubleshoot to diagnose this workshop problem and give me one clear next action."

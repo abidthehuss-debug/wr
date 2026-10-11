@@ -1,0 +1,4 @@
+interface:
+  display_name: "Workshop Planner"
+  short_description: "Turn an idea into a small approved MVP plan"
+  default_prompt: "Use $workshop to plan my project idea as a small approved MVP."

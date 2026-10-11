@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# lavish-verify — layered verification for the workshop Lavish integration.
+#
+#   static        L0: syntax, config validity, provider parity, hygiene
+#   patch         patch unit tests against a pristine tree
+#   artifacts     L1: artifact builders over checked-in fixtures
+#   live          L2: real server + proxy-shaped HTTP (+ real forwarded origin
+#                 when run inside a Codespace)
+#   browser       L3: headless-browser UI loop (installs dev-only tooling on
+#                 first use; never part of attendee setup)
+#   post-create   fast subset for container creation: static + artifacts + a
+#                 bounded real-server boot smoke
+#   template      "Use this template" simulation: archive-extract the tracked
+#                 tree, re-init git, re-run static + artifacts there
+#   all           static + patch + artifacts + live
+#   report        summarize recorded evidence
+#
+# Options: --times N   repeat the layer N times (evidence per iteration)
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "$script_dir/../.." && pwd)"
+tests_dir="$script_dir/tests"
+patch_script="$script_dir/patch-lavish-feedback.mjs"
+evidence_dir="$repo_root/.workshop-local/verification"
+evidence_file="$evidence_dir/runs.jsonl"
+
+usage() {
+  sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  exit 2
+}
+
+record() { # record <layer> <iteration> <result> <duration_s>
+  mkdir -p "$evidence_dir"
+  printf '{"ts":"%s","layer":"%s","iteration":%s,"result":"%s","duration_s":%s}\n' \
+    "$(date -u +%FT%TZ)" "$1" "$2" "$3" "$4" >>"$evidence_file"
+}
+
+run_layer_once() { # run_layer_once <layer> -> exit status of the layer
+  case "$1" in
+    static) bash "$tests_dir/check-static.sh" ;;
+    patch) node "$tests_dir/check-patch.mjs" ;;
+    artifacts) bash "$tests_dir/check-artifacts.sh" ;;
+    live) node "$tests_dir/check-live-http.mjs" ;;
+    browser) run_browser_once ;;
+    *) return 2 ;;
+  esac
+}
+
+run_browser_once() {
+  if [ ! -d "$tests_dir/node_modules/puppeteer-core" ]; then
+    echo "Installing dev-only browser test tooling (never part of attendee setup)..."
+    (cd "$tests_dir" && npm ci --no-audit --no-fund >/dev/null)
+  fi
+  node "$tests_dir/check-browser-loop.mjs"
+}
+
+run_layer() { # run_layer <layer> <times>
+  local layer="$1" times="$2" iteration=1 passes=0 status started duration
+  while [ "$iteration" -le "$times" ]; do
+    echo "=== $layer: iteration $iteration/$times ==="
+    started="$(date +%s)"
+    status=0
+    run_layer_once "$layer" || status=$?
+    duration=$(( $(date +%s) - started ))
+    if [ "$status" -eq 0 ]; then
+      passes=$((passes + 1))
+      record "$layer" "$iteration" "pass" "$duration"
+    else
+      record "$layer" "$iteration" "fail" "$duration"
+      echo "$layer: iteration $iteration FAILED (after $passes consecutive pass(es))." >&2
+      exit 1
+    fi
+    iteration=$((iteration + 1))
+  done
+  echo "$layer: $passes/$times consecutive passes."
+}
+
+cmd_post_create() {
+  local expected_patch_marker
+  expected_patch_marker="$(node --input-type=module -e "const m = await import('file://$patch_script'); console.log(m.patchMarker)")"
+  bash "$tests_dir/check-static.sh"
+  bash "$tests_dir/check-artifacts.sh"
+  echo "=== boot smoke: real server open/health/end on an ephemeral port ==="
+  local smoke_port smoke_dir status=0
+  smoke_port=$((21000 + RANDOM % 20000))
+  smoke_dir="$(mktemp -d "${TMPDIR:-/tmp}/lavish-smoke.XXXXXX")"
+  cp "$tests_dir/fixtures/static-html/review.html" "$smoke_dir/smoke.html"
+  (
+    export LAVISH_AXI_PORT="$smoke_port"
+    bash "$repo_root/workshop/scripts/lavish-review" open "$smoke_dir/smoke.html" >/dev/null
+    curl -sS -m 3 "http://127.0.0.1:${smoke_port}/health" | grep -q "\"workshop_feedback_patch\":${expected_patch_marker}"
+    bash "$repo_root/workshop/scripts/lavish-review" end >/dev/null
+    bash "$repo_root/workshop/scripts/lavish-review" stop >/dev/null
+  ) || status=$?
+  rm -rf "$smoke_dir"
+  if [ "$status" -ne 0 ]; then
+    echo "boot smoke FAILED: the pinned Lavish server did not open/answer/stop cleanly." >&2
+    exit 1
+  fi
+  echo "boot smoke passed."
+}
+
+cmd_template() {
+  local copy status=0
+  copy="$(mktemp -d "${TMPDIR:-/tmp}/lavish-template.XXXXXX")"
+  echo "=== template simulation in $copy ==="
+  # Tracked + staged + untracked-unignored files of the CURRENT tree, so the
+  # simulation also validates work in progress (git archive would only see
+  # committed state). Modes and symlinks survive through tar.
+  (cd "$repo_root" && git ls-files --cached --others --exclude-standard -z \
+    | tar --null -cf - -T -) | tar -xf - -C "$copy"
+  for link in .claude/skills/lavish .claude/skills/troubleshoot/references .claude/skills/guide/references; do
+    if [ -L "$copy/$link" ] && [ -e "$copy/$link" ]; then
+      echo "ok: symlink survives template copy: $link"
+    else
+      echo "FAIL: symlink broken after template copy: $link" >&2
+      status=1
+    fi
+  done
+  for exe in workshop/scripts/lavish-review workshop/scripts/lavish-verify; do
+    if [ -x "$copy/$exe" ]; then
+      echo "ok: executable bit survives: $exe"
+    else
+      echo "FAIL: executable bit lost: $exe" >&2
+      status=1
+    fi
+  done
+  (
+    cd "$copy"
+    git init -q && git add -A && git -c user.email=t@t -c user.name=t commit -qm 'template'
+    bash workshop/scripts/tests/check-static.sh
+    bash workshop/scripts/tests/check-artifacts.sh
+  ) || status=1
+  rm -rf "$copy"
+  [ "$status" -eq 0 ] || exit 1
+  echo "template simulation passed."
+}
+
+cmd_report() {
+  [ -f "$evidence_file" ] || { echo "No recorded runs yet ($evidence_file)."; exit 0; }
+  node -e '
+    const fs = require("fs");
+    const lines = fs.readFileSync(process.argv[1], "utf8").trim().split("\n").filter(Boolean).map(JSON.parse);
+    const layers = {};
+    for (const run of lines) {
+      const l = layers[run.layer] ||= { pass: 0, fail: 0, streak: 0, last: "" };
+      if (run.result === "pass") { l.pass += 1; l.streak += 1; } else { l.fail += 1; l.streak = 0; }
+      l.last = run.ts;
+    }
+    console.log("layer          pass  fail  current-consecutive  last-run");
+    for (const [name, l] of Object.entries(layers)) {
+      console.log(`${name.padEnd(14)} ${String(l.pass).padStart(4)} ${String(l.fail).padStart(5)} ${String(l.streak).padStart(20)}  ${l.last}`);
+    }
+    console.log("\nRule: any failure resets the consecutive counter for its layer.");
+  ' "$evidence_file"
+}
+
+command="${1:-}"
+[ $# -gt 0 ] && shift
+times=1
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --times)
+      shift
+      times="${1:-1}"
+      ;;
+    *) usage ;;
+  esac
+  shift || true
+done
+case "$times" in '' | *[!0-9]*) usage ;; esac
+
+case "$command" in
+  static | patch | artifacts | live | browser) run_layer "$command" "$times" ;;
+  post-create) cmd_post_create ;;
+  template) cmd_template ;;
+  all)
+    run_layer static 1
+    run_layer patch 1
+    run_layer artifacts "$times"
+    run_layer live "$times"
+    ;;
+  report) cmd_report ;;
+  '' | help | --help | -h) usage ;;
+  *)
+    echo "lavish-verify: unknown subcommand '$command'." >&2
+    usage
+    ;;
+esac

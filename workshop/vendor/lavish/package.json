@@ -1,0 +1,8 @@
+{
+  "name": "workshop-lavish-runtime",
+  "private": true,
+  "description": "Workshop-owned pinned install of the Lavish review CLI. The dependency version here is the single source of truth for the pinned Lavish release; workshop/scripts/lavish-review install materialises it with npm ci and applies workshop/scripts/patch-lavish-feedback.mjs.",
+  "dependencies": {
+    "lavish-axi": "0.1.50"
+  }
+}

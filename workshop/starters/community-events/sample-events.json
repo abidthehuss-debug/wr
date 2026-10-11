@@ -1,0 +1,68 @@
+[
+  {
+    "id": "demo-coding-evening",
+    "title": "Community Coding Evening",
+    "dayOffset": 3,
+    "time": "18:30",
+    "timezone": "Europe/London",
+    "category": "Learning",
+    "location": "Learning Centre",
+    "isOnline": false,
+    "description": "A relaxed evening of beginner-friendly coding practice and shared problem solving."
+  },
+  {
+    "id": "demo-business-coffee",
+    "title": "Small Business Coffee Morning",
+    "dayOffset": 6,
+    "time": "09:30",
+    "timezone": "Europe/London",
+    "category": "Business",
+    "location": "Community Hall",
+    "isOnline": false,
+    "description": "An informal chance for local founders and freelancers to exchange ideas."
+  },
+  {
+    "id": "demo-photography",
+    "title": "Introduction to Photography",
+    "dayOffset": 9,
+    "time": "14:00",
+    "timezone": "Europe/London",
+    "category": "Learning",
+    "location": "Town Library",
+    "isOnline": false,
+    "description": "Learn simple composition and lighting techniques with any camera or phone."
+  },
+  {
+    "id": "demo-wellbeing-walk",
+    "title": "Weekend Wellbeing Walk",
+    "dayOffset": 12,
+    "time": "10:00",
+    "timezone": "Europe/London",
+    "category": "Wellbeing",
+    "location": "Riverside Park",
+    "isOnline": false,
+    "description": "A friendly, gentle group walk with time to meet new people outdoors."
+  },
+  {
+    "id": "demo-careers-workshop",
+    "title": "CV and Careers Workshop",
+    "dayOffset": 16,
+    "time": "17:30",
+    "timezone": "Europe/London",
+    "category": "Community",
+    "location": "Community Hall",
+    "isOnline": false,
+    "description": "Practical tips for presenting your experience and planning your next step."
+  },
+  {
+    "id": "demo-online-ideas",
+    "title": "Online Community Ideas Session",
+    "dayOffset": 20,
+    "time": "19:00",
+    "timezone": "Europe/London",
+    "category": "Social",
+    "location": "Online",
+    "isOnline": true,
+    "description": "Share ideas for future activities in a welcoming online group conversation."
+  }
+]

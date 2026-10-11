@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Second Brain Map Fixture</title>
+    <style>
+      body { margin: 0; background: #11151a; color: #e8e4da; font-family: system-ui, sans-serif; }
+      .map { max-width: 46rem; margin: 0 auto; padding: 2rem 1rem; }
+      .category { border: 1px solid #3a4450; border-radius: 0.5rem; padding: 1rem; margin-top: 1rem; background: #1a2027; }
+      .category h2 { margin-top: 0; color: #8fd0a0; }
+      .source { display: inline-block; background: #26303a; border-radius: 999px; padding: 0.2rem 0.75rem; margin: 0.15rem; }
+      .privacy { border-left: 4px solid #d0a08f; padding-left: 0.75rem; margin-top: 1.5rem; }
+      svg { width: 100%; height: auto; }
+    </style>
+  </head>
+  <body>
+    <div class="map">
+      <h1>Second Brain — Memory Map</h1>
+      <svg viewBox="0 0 400 120" role="img" aria-label="Memory categories connected to the vault">
+        <circle cx="200" cy="60" r="26" fill="#26303a" stroke="#8fd0a0" />
+        <text x="200" y="64" text-anchor="middle" fill="#e8e4da" font-size="10">Vault</text>
+        <line x1="226" y1="60" x2="320" y2="30" stroke="#3a4450" />
+        <line x1="174" y1="60" x2="80" y2="30" stroke="#3a4450" />
+        <text x="320" y="26" text-anchor="middle" fill="#e8e4da" font-size="9">projects</text>
+        <text x="80" y="26" text-anchor="middle" fill="#e8e4da" font-size="9">decisions</text>
+      </svg>
+      <div class="category">
+        <h2>Projects</h2>
+        <span class="source">projects.md</span>
+        <p>Example question: “What is the current status of the workshop?”</p>
+      </div>
+      <div class="category">
+        <h2>Decisions</h2>
+        <span class="source">decisions.md</span>
+        <p>Example question: “Why did we pick a static map over a dashboard?”</p>
+      </div>
+      <div class="privacy">
+        <strong>Privacy mode:</strong> local-only; no live queries leave this machine.
+      </div>
+    </div>
+  </body>
+</html>

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Workshop Guide"
+  short_description: "Know exactly what to do next"
+  default_prompt: "Use $guide to tell me the next workshop action in simple language."
